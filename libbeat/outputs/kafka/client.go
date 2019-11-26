@@ -124,6 +124,10 @@ func (c *client) Close() error {
 	return nil
 }
 
+// ConcatInSingleEvent is an awesome hack^Wfeature
+//
+const ConcatInSingleEvent bool = true
+
 func (c *client) Publish(batch publisher.Batch) error {
 	events := batch.Events()
 	c.observer.NewBatch(len(events))
@@ -136,21 +140,67 @@ func (c *client) Publish(batch publisher.Batch) error {
 		batch:  batch,
 	}
 
+	if !ConcatInSingleEvent {
+		return c.publishEvents(batch, ref)
+	}
+	return c.publishMultipleEventsAsOneEvent(batch, ref)
+}
+
+func (c *client) publishEvents(batch publisher.Batch, ref *msgRef) error {
+	events := batch.Events()
+
 	ch := c.producer.Input()
 	for i := range events {
-		d := &events[i]
-		msg, err := c.getEventMessage(d)
+		msg, err := c.getEventMessage(&events[i])
 		if err != nil {
 			logp.Err("Dropping event: %v", err)
 			ref.done()
 			c.observer.Dropped(1)
 			continue
 		}
+		// encode each event using codec
+		serializedEvent, err := c.codec.Encode(c.index, &events[i].Content)
+		if err != nil {
+			logp.Debug("kafka", "Failed encoding event: %v", &events[i].Content)
+			ref.done()
+			c.observer.Dropped(1)
+			continue
+		}
+		buf := make([]byte, len(serializedEvent))
+		copy(buf, serializedEvent)
+		msg.value = buf
 
 		msg.ref = ref
 		msg.initProducerMessage()
 		ch <- &msg.msg
 	}
+
+	return nil
+}
+
+func (c *client) publishMultipleEventsAsOneEvent(batch publisher.Batch, ref *msgRef) error {
+	events := batch.Events()
+
+	ch := c.producer.Input()
+	msg, err := c.getEventMessage(&events[0])
+	if err != nil {
+		logp.Err("Dropping event: %v", err)
+		ref.done()
+		c.observer.Dropped(len(events))
+		return nil
+	}
+	// concatenate payload of all events together into one string
+	var concatenatedPayload strings.Builder
+	for i := range events {
+		serializedEvent, _ := c.codec.Encode(c.index, &events[i].Content)
+		concatenatedPayload.WriteString(string(serializedEvent))
+	}
+	// todo add gzip'ing
+	msg.value = []byte(concatenatedPayload.String())
+
+	msg.ref = ref
+	msg.initProducerMessage()
+	ch <- &msg.msg
 
 	return nil
 }
@@ -189,16 +239,6 @@ func (c *client) getEventMessage(data *publisher.Event) (*message, error) {
 		}
 		event.Meta["topic"] = topic
 	}
-
-	serializedEvent, err := c.codec.Encode(c.index, event)
-	if err != nil {
-		logp.Debug("kafka", "Failed event: %v", event)
-		return nil, err
-	}
-
-	buf := make([]byte, len(serializedEvent))
-	copy(buf, serializedEvent)
-	msg.value = buf
 
 	// message timestamps have been added to kafka with version 0.10.0.0
 	if c.config.Version.IsAtLeast(sarama.V0_10_0_0) {
